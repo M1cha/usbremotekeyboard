@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+
+import atexit
+import dbus
+import gatt
+import queue
+import os
+import sys
+import termios
+import threading
+import tty
+
+
+HID_KEY_A = 4
+HID_KEY_B = 5
+HID_KEY_C = 6
+HID_KEY_D = 7
+HID_KEY_E = 8
+HID_KEY_F = 9
+HID_KEY_G = 10
+HID_KEY_H = 11
+HID_KEY_I = 12
+HID_KEY_J = 13
+HID_KEY_K = 14
+HID_KEY_L = 15
+HID_KEY_M = 16
+HID_KEY_N = 17
+HID_KEY_O = 18
+HID_KEY_P = 19
+HID_KEY_Q = 20
+HID_KEY_R = 21
+HID_KEY_S = 22
+HID_KEY_T = 23
+HID_KEY_U = 24
+HID_KEY_V = 25
+HID_KEY_W = 26
+HID_KEY_X = 27
+HID_KEY_Y = 28
+HID_KEY_Z = 29
+HID_KEY_1 = 30
+HID_KEY_2 = 31
+HID_KEY_3 = 32
+HID_KEY_4 = 33
+HID_KEY_5 = 34
+HID_KEY_6 = 35
+HID_KEY_7 = 36
+HID_KEY_8 = 37
+HID_KEY_9 = 38
+HID_KEY_0 = 39
+HID_KEY_ENTER = 40
+HID_KEY_ESC = 41
+HID_KEY_BACKSPACE = 42
+HID_KEY_TAB = 43
+HID_KEY_SPACE = 44
+HID_KEY_MINUS = 45
+HID_KEY_EQUAL = 46
+HID_KEY_LEFTBRACE = 47
+HID_KEY_RIGHTBRACE = 48
+HID_KEY_BACKSLASH = 49
+HID_KEY_HASH = 50  # Non-US # and ~
+HID_KEY_SEMICOLON = 51
+HID_KEY_APOSTROPHE = 52
+HID_KEY_GRAVE = 53
+HID_KEY_COMMA = 54
+HID_KEY_DOT = 55
+HID_KEY_SLASH = 56
+HID_KEY_CAPSLOCK = 57
+HID_KEY_F1 = 58
+HID_KEY_F2 = 59
+HID_KEY_F3 = 60
+HID_KEY_F4 = 61
+HID_KEY_F5 = 62
+HID_KEY_F6 = 63
+HID_KEY_F7 = 64
+HID_KEY_F8 = 65
+HID_KEY_F9 = 66
+HID_KEY_F10 = 67
+HID_KEY_F11 = 68
+HID_KEY_F12 = 69
+HID_KEY_SYSRQ = 70  # PRINTSCREEN
+HID_KEY_SCROLLLOCK = 71
+HID_KEY_PAUSE = 72
+HID_KEY_INSERT = 73
+HID_KEY_HOME = 74
+HID_KEY_PAGEUP = 75
+HID_KEY_DELETE = 76
+HID_KEY_END = 77
+HID_KEY_PAGEDOWN = 78
+HID_KEY_RIGHT = 79
+HID_KEY_LEFT = 80
+HID_KEY_DOWN = 81
+HID_KEY_UP = 82
+HID_KEY_NUMLOCK = 83
+HID_KEY_KPSLASH = 84  # NUMPAD DIVIDE
+HID_KEY_KPASTERISK = 85  # NUMPAD MULTIPLY
+HID_KEY_KPMINUS = 86
+HID_KEY_KPPLUS = 87
+HID_KEY_KPENTER = 88
+HID_KEY_KP_1 = 89
+HID_KEY_KP_2 = 90
+HID_KEY_KP_3 = 91
+HID_KEY_KP_4 = 92
+HID_KEY_KP_5 = 93
+HID_KEY_KP_6 = 94
+HID_KEY_KP_7 = 95
+HID_KEY_KP_8 = 96
+HID_KEY_KP_9 = 97
+HID_KEY_KP_0 = 98
+
+HID_KBD_MODIFIER_NONE = 0x00
+HID_KBD_MODIFIER_LEFT_CTRL = 0x01
+HID_KBD_MODIFIER_LEFT_SHIFT = 0x02
+HID_KBD_MODIFIER_LEFT_ALT = 0x04
+HID_KBD_MODIFIER_LEFT_UI = 0x08
+HID_KBD_MODIFIER_RIGHT_CTRL = 0x10
+HID_KBD_MODIFIER_RIGHT_SHIFT = 0x20
+HID_KBD_MODIFIER_RIGHT_ALT = 0x40
+HID_KBD_MODIFIER_RIGHT_UI = 0x80
+
+
+def write_value_noresponse(char, value, offset=0):
+    bytes = [dbus.Byte(b) for b in value]
+
+    try:
+        char._object.WriteValue(
+            bytes,
+            {"offset": dbus.UInt16(offset, variant_level=1), "type": "command"},
+            reply_handler=char._write_value_succeeded,
+            error_handler=char._write_value_failed,
+            dbus_interface="org.bluez.GattCharacteristic1",
+        )
+    except dbus.exceptions.DBusException as e:
+        char._write_value_failed(char, error=e)
+
+
+class AnyDevice(gatt.Device):
+    def __init__(self, mac_address, manager):
+        super().__init__(mac_address, manager)
+
+        self.lock = threading.Lock()
+        self.q = queue.Queue()
+        self.writing = None
+        self.uart_rx_characteristic = None
+
+    def connect_succeeded(self):
+        super().connect_succeeded()
+        print("[%s] Connected" % (self.mac_address))
+
+    def connect_failed(self, error):
+        super().connect_failed(error)
+        print("[%s] Connection failed: %s" % (self.mac_address, str(error)))
+
+    def disconnect_succeeded(self):
+        super().disconnect_succeeded()
+        print("[%s] Disconnected" % (self.mac_address))
+        self.uart_rx_characteristic = None
+        self.writing = None
+
+    def services_resolved(self):
+        super().services_resolved()
+
+        print("[%s] Resolved services" % (self.mac_address))
+
+        uart_service = next(
+            s
+            for s in self.services
+            if s.uuid == "6E400001-B5A3-F393-E0A9-E50E24DCCA9E".lower()
+        )
+
+        self.uart_rx_characteristic = next(
+            c
+            for c in uart_service.characteristics
+            if c.uuid == "6E400002-B5A3-F393-E0A9-E50E24DCCA9E".lower()
+        )
+
+        self.trigger_write()
+
+    def characteristic_write_value_succeeded(self, characteristic):
+        with self.lock:
+            self.writing = None
+        self.trigger_write()
+
+    def characteristic_write_value_failed(self, characteristic, error):
+        print(f"write failed: {error}\r")
+        with self.lock:
+            self.writing = None
+        self.trigger_write()
+
+    def write(self, arr):
+        self.q.put(arr)
+
+    def trigger_write(self):
+        with self.lock:
+            if self.writing is not None:
+                return
+            if self.uart_rx_characteristic is None:
+                print("not connected\r")
+                return
+
+            try:
+                arr = self.q.get_nowait()
+            except queue.Empty:
+                return
+            self.writing = arr
+            write_value_noresponse(self.uart_rx_characteristic, arr)
+            # self.uart_rx_characteristic.write_value(arr)
+
+
+manager = gatt.DeviceManager(adapter_name="hci0")
+device = AnyDevice(mac_address=sys.argv[1], manager=manager)
+device.connect()
+threading.Thread(target=manager.run, daemon=True).start()
+
+fd = sys.stdin.fileno()
+old_settings = termios.tcgetattr(fd)
+
+
+def exit_handler():
+    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+atexit.register(exit_handler)
+tty.setraw(sys.stdin)
+
+
+def needs_shift(b):
+    if (b < 33) or (b == 39):
+        return False
+    elif (b >= 33) and (b < 44):
+        return True
+    elif (b >= 44) and (b < 58):
+        return False
+    elif (b == 59) or (b == 61):
+        return False
+    elif (b >= 58) and (b < 91):
+        return True
+    elif (b >= 91) and (b < 94):
+        return False
+    elif (b == 94) or (b == 95):
+        return True
+    elif (b > 95) and (b < 123):
+        return False
+    elif (b > 122) and (b < 127):
+        return True
+    else:
+        return False
+
+
+def ascii2hid(b):
+    rep = bytearray(8)
+
+    if b < 32:
+        if b == 0:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_2
+        elif b == 1:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_A
+        elif b == 3:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_C
+        elif b == 5:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_E
+        elif b == 6:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_F
+        elif b == 7:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_G
+        elif b == 8:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_H
+        elif b == 9:
+            ch = HID_KEY_TAB
+        elif b == 10:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_J
+        elif b == 11:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_K
+        elif b == 12:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_L
+        elif b == 13:
+            ch = HID_KEY_ENTER
+        elif b == 14:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_N
+        elif b == 15:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_O
+        elif b == 16:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_P
+        elif b == 17:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_Q
+        elif b == 18:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_R
+        elif b == 19:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_S
+        elif b == 20:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_T
+        elif b == 21:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_U
+        elif b == 22:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_V
+        elif b == 23:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_W
+        elif b == 24:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_X
+        elif b == 25:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_Y
+        elif b == 26:
+            rep[0] |= HID_KBD_MODIFIER_LEFT_CTRL
+            ch = HID_KEY_Z
+        elif b == 27:
+            ch = HID_KEY_ESC
+        else:
+            return None
+    elif b < 48:
+        # Special characters
+        if b == 32:
+            ch = HID_KEY_SPACE
+        elif b == 33:
+            ch = HID_KEY_1
+        elif b == 34:
+            ch = HID_KEY_APOSTROPHE
+        elif b == 35:
+            ch = HID_KEY_3
+        elif b == 36:
+            ch = HID_KEY_4
+        elif b == 37:
+            ch = HID_KEY_5
+        elif b == 38:
+            ch = HID_KEY_7
+        elif b == 39:
+            ch = HID_KEY_APOSTROPHE
+        elif b == 40:
+            ch = HID_KEY_9
+        elif b == 41:
+            ch = HID_KEY_0
+        elif b == 42:
+            ch = HID_KEY_8
+        elif b == 43:
+            ch = HID_KEY_EQUAL
+        elif b == 44:
+            ch = HID_KEY_COMMA
+        elif b == 45:
+            ch = HID_KEY_MINUS
+        elif b == 46:
+            ch = HID_KEY_DOT
+        elif b == 47:
+            ch = HID_KEY_SLASH
+        else:
+            assert False
+    elif b < 58:
+        # Numbers
+        if b == 48:
+            ch = HID_KEY_0
+        else:
+            ch = b - 19
+    elif b < 65:
+        # Special characters #2
+        if b == 58:
+            ch = HID_KEY_SEMICOLON
+        elif b == 59:
+            ch = HID_KEY_SEMICOLON
+        elif b == 60:
+            ch = HID_KEY_COMMA
+        elif b == 61:
+            ch = HID_KEY_EQUAL
+        elif b == 62:
+            ch = HID_KEY_DOT
+        elif b == 63:
+            ch = HID_KEY_SLASH
+        elif b == 64:
+            ch = HID_KEY_2
+        else:
+            assert False
+    elif b < 91:
+        # Uppercase characters
+        ch = b - 61
+    elif b < 97:
+        # Special characters #3
+        if b == 91:
+            ch = HID_KEY_LEFTBRACE
+        elif b == 92:
+            ch = HID_KEY_BACKSPACE
+        elif b == 93:
+            ch = HID_KEY_RIGHTBRACE
+        elif b == 94:
+            ch = HID_KEY_6
+        elif b == 95:
+            ch = HID_KEY_MINUS
+        elif b == 96:
+            ch = HID_KEY_GRAVE
+        else:
+            assert False
+    elif b < 123:
+        # Lowercase letters
+        ch = b - 93
+    elif b < 128:
+        #  Special characters #4
+        if b == 123:
+            ch = HID_KEY_LEFTBRACE
+        elif b == 124:
+            ch = HID_KEY_BACKSLASH
+        elif b == 125:
+            ch = HID_KEY_RIGHTBRACE
+        elif b == 126:
+            ch = HID_KEY_GRAVE
+        elif b == 127:
+            ch = HID_KEY_BACKSPACE
+        else:
+            assert False
+
+    rep[7] = ch
+
+    if needs_shift(b):
+        rep[0] |= HID_KBD_MODIFIER_RIGHT_SHIFT
+
+    return rep
+
+
+while True:
+    b = os.read(fd, 1)
+    b = b[0]
+
+    if b == 4:
+        sys.exit(1)
+
+    rep = ascii2hid(b)
+    if rep is None:
+        print(b, "\r")
+        continue
+
+    device.write(rep)
+    device.trigger_write()

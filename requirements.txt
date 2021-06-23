@@ -1,0 +1,3 @@
+gatt
+dbus-python
+PyGObject
